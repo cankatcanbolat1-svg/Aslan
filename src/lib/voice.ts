@@ -1,5 +1,5 @@
 import { BRIDGE_HTTP_URL } from '../config'
-import { getMic } from './audio'
+import { getMic, releaseMic } from './audio'
 import { speakingNow, speakingSince } from './tts'
 import { startVad, type Vad } from './vad'
 import { caps } from './capabilities'
@@ -55,6 +55,10 @@ export type Voice = {
   stop: () => void
   /** True while a recogniser is actually running. */
   live: () => boolean
+  /** A real mute: releases the actual recogniser/capture on true, and
+   *  re-acquires it on false. Not the same as mode 'deaf', which only
+   *  changes what is done with results while capture stays live. */
+  setMuted: (muted: boolean) => void
 }
 
 // ---------------------------------------------------------------------------
@@ -65,27 +69,66 @@ export type Voice = {
 const WAKE_DEBOUNCE = 1500
 
 /**
- * His name, and the only wake phrase.
+ * His name, matched by sound rather than by spelling.
  *
- * The optional prefix is genuinely optional: addressing him by name alone is
- * correct, and during an answer "Jarvis" on its own is the natural way to cut
- * in. The negative lookahead keeps possessives ("Jarvis's job") from waking him.
+ * An enumerated list of mishears chases a moving target — every accent and
+ * every speech engine mangles a name differently — so instead this matches
+ * anything within a couple of edits of "aslan" (arslan, aslaan, azlan and
+ * the like), the same way the previous English name was matched against
+ * "jarvis".
  *
- * The alternates are not padding. "Jarvis" is not in a general dictation
- * model's high-frequency vocabulary, and Chrome routinely returns Travis,
- * Jervis, Jarvys or Java's for a perfectly clear utterance — every one of which
- * used to be silently discarded, so the wake word "just didn't work" with no
- * indication why. Better a rare false wake than a name that does not answer.
+ * "Aslan" is an ordinary Turkish word ("lion"), not a made-up name like the
+ * one before it, so it will wake on more than just his name — "aslanım"
+ * used affectionately, "aslan gibi" and so on. That trade was made on
+ * purpose when the name was chosen; if it turns out to be too trigger-happy
+ * in practice, the fix is narrowing WAKE_MAX_DISTANCE below, not widening it.
+ *
+ * The possessive guard ("Aslan's job" should not wake him) has to be
+ * re-checked here rather than left to a regex lookahead, since word-boundary
+ * splitting on punctuation already separates the name from "'s".
  */
-const WAKE =
-  /\b(?:hey|hi|ok|okay|yo)?\s*(?:jarvis|jarvys|jervis|jarvis's|travis|jarviss|java's|jarv)\b(?!'s)/i
+const WAKE_NAME = 'aslan'
+const WAKE_MAX_DISTANCE = 2
+const WAKE_WORD_RE = /\p{L}+/gu
+
+function levenshtein(a: string, b: string): number {
+  const dp: number[][] = Array.from({ length: a.length + 1 }, () => new Array(b.length + 1).fill(0))
+  for (let i = 0; i <= a.length; i++) dp[i][0] = i
+  for (let j = 0; j <= b.length; j++) dp[0][j] = j
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      dp[i][j] =
+        a[i - 1] === b[j - 1]
+          ? dp[i - 1][j - 1]
+          : 1 + Math.min(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1])
+    }
+  }
+  return dp[a.length][b.length]
+}
+
+/** Finds the wake word by sound. Returns where it ends, or null. */
+function findWake(text: string): { end: number } | null {
+  WAKE_WORD_RE.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = WAKE_WORD_RE.exec(text))) {
+    const word = m[0].toLowerCase()
+    // Short words (hi, ok, is, a...) sit within two edits of almost anything
+    // six letters long, so they're excluded rather than treated as misses.
+    if (word.length < 4) continue
+    if (levenshtein(word, WAKE_NAME) > WAKE_MAX_DISTANCE) continue
+    const end = m.index + m[0].length
+    if (/^['’]s\b/.test(text.slice(end))) continue // "Jarvis's job" — not a wake
+    return { end }
+  }
+  return null
+}
 
 /** Everything after the wake phrase, which is usually the actual command. */
 function afterWake(text: string): string {
-  const m = WAKE.exec(text)
-  if (!m) return ''
+  const hit = findWake(text)
+  if (!hit) return ''
   return text
-    .slice(m.index + m[0].length)
+    .slice(hit.end)
     .replace(/^[\s,.:;!?-]+/, '')
     .trim()
 }
@@ -123,7 +166,7 @@ function afterWake(text: string): string {
  * last word of a real request.
  */
 const CONTINUES =
-  /\b(and|or|but|so|because|since|if|when|while|that|which|who|whose|to|of|in|on|at|by|for|with|from|about|into|onto|over|under|between|through|the|a|an|my|your|his|her|its|our|their|is|are|was|were|be|been|do|does|did|have|has|had|can|could|would|should|will|shall|might|must|like|than|then|as|very|really|just|some|any|all|both|either|neither)$/i
+  /\b(ve|veya|ya da|ama|fakat|ancak|çünkü|eğer|ki|ile|için|gibi|kadar|göre|rağmen|üzere|diye|de|da|ben|sen|biz|siz|bu|şu|o|bir|çok|daha|en|nasıl|neden|niçin|hangi)$/i
 
 /** Trailing punctuation a transcriber emits mid-thought. */
 const TRAILS = /[,;:–—-]$/
@@ -256,8 +299,8 @@ function makeAssembler(h: {
 
 const norm = (s: string) =>
   s
-    .toLowerCase()
-    .replace(/[^a-z0-9' ]+/g, ' ')
+    .toLocaleLowerCase('tr-TR')
+    .replace(/[^a-z0-9ışğüöç' ]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
 
@@ -267,7 +310,7 @@ const norm = (s: string) =>
  * would be the single most infuriating failure this file could have.
  */
 const OVERRIDE =
-  /\b(stop|wait|jarvis|cancel|enough|quiet|hold on|shut up|never ?mind|forget it|no)\b/i
+  /\b(dur|bekle|aslan|iptal|yeter|sessiz|sus|boşver|unut|hayır)\b/i
 
 /**
  * Words too common to be evidence of anything.
@@ -279,12 +322,11 @@ const OVERRIDE =
  * Only distinctive words count as proof he is hearing himself.
  */
 const STOP = new Set(
-  ('a an the and or but so of to in on at by for with from is are was were be ' +
-    'it its this that these those i you he she we they me him her them my your ' +
-    'our their what which who how why when where do does did can could would ' +
-    'should will shall not no yes if then than as about into over under out up ' +
-    'down one two three first second third now here there just very really got ' +
-    'get have has had say said tell me okay ok well right').split(' '),
+  ('bir ve veya ama fakat ancak çünkü de da ki mi mı mu mü bu şu o ben sen biz ' +
+    'siz onlar benim senin bizim sizin onun bana sana ona bize size onlara ne ' +
+    'nasıl niçin neden niye kim hangi nerede ya evet hayır tamam efendim şimdi ' +
+    'burada orada çok gibi için üzere ile var yok oldu etti değil diye kadar ' +
+    'sonra önce şey işte bile daha en çünkü hem').split(' '),
 )
 
 /**
@@ -301,19 +343,38 @@ function isEcho(heard: string, spoken: string): boolean {
   const all = norm(heard).split(' ').filter(Boolean)
   if (!all.length) return true
 
-  const mine = new Set(norm(spoken).split(' '))
+  const mine = norm(spoken).split(' ').filter(Boolean)
   const content = all.filter((w) => !STOP.has(w))
+
+  // An interim result catches a word mid-syllable — "konuş" for
+  // "konuşmanın" — while it is still being spoken. That is his own voice
+  // just as much as the finished word is, so a truncated word counts as a
+  // match against anything it is a prefix of, in either direction, not only
+  // an exact string. Guarded to 3+ letters so short words don't prefix-match
+  // everything.
+  const matches = (w: string) =>
+    mine.some((m) => w === m || (w.length >= 3 && (m.startsWith(w) || w.startsWith(m))))
 
   // Nothing distinctive was said at all, so there is no strong evidence either
   // way. Demand a total match before discarding it — the cost of dropping a
   // real question is much higher than the cost of one stray echo getting in.
   if (content.length < 2) {
     if (all.length < 2) return false
-    return all.every((w) => mine.has(w))
+    return all.every(matches)
+  }
+
+  // A short echoed fragment routinely picks up one garbled noise word at its
+  // edge — "an iyiyim efendim" for "İyiyim efendim..." — and with only two or
+  // three content words, a 60% ratio demands every one of them match, which
+  // one bit of noise defeats every time. One genuine, distinctive hit is
+  // already strong evidence at this size; the ratio only earns its keep once
+  // there are enough words that a single miss can't dominate it.
+  if (content.length <= 3) {
+    return content.some(matches)
   }
 
   let hits = 0
-  for (const w of content) if (mine.has(w)) hits++
+  for (const w of content) if (matches(w)) hits++
   return hits / content.length >= 0.6
 }
 
@@ -396,7 +457,7 @@ export async function startVoice(h: VoiceHandlers): Promise<Voice> {
         ? 'Microphone access denied — voice input is unavailable.'
         : 'No microphone available.',
     )
-    return { stop: () => {}, live: () => false }
+    return { stop: () => {}, live: () => false, setMuted: () => {} }
   }
   diag.engine = caps().stt ? 'elevenlabs' : 'browser'
   return caps().stt ? startElevenVoice(h) : startBrowserVoice(h)
@@ -406,6 +467,18 @@ export async function startVoice(h: VoiceHandlers): Promise<Voice> {
 async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
   let lastWake = 0
   let vad: Vad | null = null
+
+  /**
+   * Falling back is for real quota/auth trouble, not one dropped request —
+   * a stray network blip shouldn't strand someone on the worse engine for
+   * the rest of the session, so this only trips after two 401s in a row.
+   * `doFallback` is assigned its real body once the VAD/guardPoll below
+   * exist; `transcribe` closes over the `let` and calls whatever it points
+   * to by the time it actually runs.
+   */
+  let consecutive401s = 0
+  let fallbackVoice: Voice | null = null
+  let doFallback: (reason: string) => void = () => {}
 
   /**
    * Segments waiting for the transcriber, oldest first.
@@ -459,9 +532,18 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       if (!res.ok) {
         diag.restarts++
         diag.lastError = `stt ${res.status}`
+        if (res.status === 401) {
+          consecutive401s++
+          if (consecutive401s >= 2) {
+            doFallback(`elevenlabs auth/quota exhausted (${res.status})`)
+          }
+        } else {
+          consecutive401s = 0
+        }
         drop(`transcription failed (${res.status})`)
         return
       }
+      consecutive401s = 0
       const { text } = (await res.json()) as { text?: string }
       const said = (text ?? '').trim()
       diag.lastError = ''
@@ -482,7 +564,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       diag.heardAt = Date.now()
 
       if (mode === 'wake') {
-        if (WAKE.test(said) && Date.now() - lastWake > WAKE_DEBOUNCE) {
+        if (findWake(said) && Date.now() - lastWake > WAKE_DEBOUNCE) {
           lastWake = Date.now()
           diag.wakes++
           diag.dropped = ''
@@ -517,7 +599,10 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
     }
   }
 
-  vad = await startVad({
+  // Pulled out so setMuted can rebuild the same VAD instance on unmute —
+  // muting actually releases the microphone track (see below), and a
+  // released MediaStreamTrack cannot be restarted, only replaced.
+  const vadConfig = () => ({
     onStart: () => {
       const mode = h.mode()
       diag.mode = mode
@@ -538,11 +623,11 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
         h.onSpeechStart()
       }
     },
-    onEnd: (blob) => {
+    onEnd: (blob: Blob) => {
       pendingAudio.push(blob)
       void drain()
     },
-    onLevel: (v) => {
+    onLevel: (v: number) => {
       // Only paint the live level while actually listening for a command, so a
       // dormant reactor stays calm and does not twitch at every room noise.
       const mode = h.mode()
@@ -553,18 +638,20 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       if (assemble.held()) return
       h.onPartial(v > 0.04 ? '…' : '')
     },
-    onError: (message) => {
+    onError: (message: string) => {
       diag.lastError = 'capture'
       diag.running = false
       h.onError(message)
     },
   })
+
+  vad = await startVad(vadConfig())
   diag.running = vad.live()
 
   // Raise the trigger bar exactly while he speaks. The mode is polled rather
   // than pushed because nothing in the app pushes phase changes here, and a
   // 200ms lag on the echo gate is imperceptible.
-  const guardPoll = setInterval(() => {
+  let guardPoll = setInterval(() => {
     const mode = h.mode()
     vad?.setGuard(mode === 'guard')
     // He has stood down — by Escape, by the idle timeout, or by dropping back
@@ -574,14 +661,62 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
     if ((mode === 'wake' || mode === 'deaf') && assemble.held()) assemble.cancel()
   }, 200)
 
+  let muted = false
+
+  let fallingBack = false
+  doFallback = (reason) => {
+    if (fallbackVoice || fallingBack) return // already switched, or switching
+    fallingBack = true
+    diag.lastError = reason
+    diag.engine = 'browser'
+    clearInterval(guardPoll)
+    assemble.cancel()
+    vad?.stop()
+    void startBrowserVoice(h).then((v) => {
+      fallbackVoice = v
+    })
+  }
+
   return {
     stop: () => {
+      if (fallbackVoice) {
+        fallbackVoice.stop()
+        return
+      }
       clearInterval(guardPoll)
       assemble.cancel()
       vad?.stop()
       diag.running = false
     },
-    live: () => vad?.live() ?? false,
+    live: () => fallbackVoice?.live() ?? vad?.live() ?? false,
+    setMuted: (m) => {
+      if (fallbackVoice) {
+        fallbackVoice.setMuted(m)
+        return
+      }
+      if (m === muted) return
+      muted = m
+      if (m) {
+        clearInterval(guardPoll)
+        assemble.cancel()
+        vad?.stop()
+        vad = null
+        diag.running = false
+        // The real release — a stopped VAD leaves the underlying
+        // MediaStreamTrack live, which is the whole bug this exists to fix.
+        releaseMic()
+      } else {
+        void (async () => {
+          vad = await startVad(vadConfig())
+          diag.running = vad.live()
+          guardPoll = setInterval(() => {
+            const mode = h.mode()
+            vad?.setGuard(mode === 'guard')
+            if ((mode === 'wake' || mode === 'deaf') && assemble.held()) assemble.cancel()
+          }, 200)
+        })()
+      }
+    },
   }
 }
 
@@ -599,16 +734,56 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
  * between "the wake word stopped working halfway through the lesson" and an
  * assistant that keeps listening.
  */
-function startBrowserVoice(h: VoiceHandlers): Voice {
+async function startBrowserVoice(h: VoiceHandlers): Promise<Voice> {
   const Ctor =
     (window as any).SpeechRecognition ?? (window as any).webkitSpeechRecognition
   if (!Ctor) {
     h.onError('This browser has no speech recognition — use Chrome or Edge, or add an ElevenLabs key.')
-    return { stop: () => {}, live: () => false }
+    return { stop: () => {}, live: () => false, setMuted: () => {} }
+  }
+
+  /**
+   * The barge-in problem this engine has always had: SpeechRecognition hands
+   * back text with no idea how loud it was, so telling a real interruption
+   * from his own voice leaking back through the speakers came down to
+   * guessing from word count and timing — and a real answer routinely has
+   * two or more words in it, so that guess was never going to hold up.
+   *
+   * `startVad` already solves exactly this, with a noise floor that adapts to
+   * the room and a threshold that rises while he's talking — it just does it
+   * to decide when to *record*, for Scribe. Here it is used for nothing but
+   * that same decision: its `onStart` fires on real, confirmed loudness, and
+   * that is what triggers the barge-in below, in guard mode, instead of
+   * anything read out of the transcript. The audio it captures is thrown
+   * away — Chrome's own recogniser is already transcribing in parallel — so
+   * this is pure judgement, not a second speech-to-text path.
+   */
+  const vadConfig = () => ({
+    onStart: () => {
+      if (h.mode() !== 'guard') return
+      // Chrome's recogniser has been accumulating the whole time his own
+      // reply was leaking back in, waiting for the energy gate to confirm
+      // anything — so by the time it does, `settled` already holds a run of
+      // his own words with nothing to mark where they end and the real
+      // question begins. Discarding it here is safe precisely because it is
+      // confirmed to be leaked echo, not a real sentence in progress.
+      reset()
+      h.onSpeechStart()
+    },
+    onEnd: () => {},
+    onLevel: () => {},
+    onError: () => {}, // no VAD is a downgrade, not a failure — text heuristics still run
+  })
+  let vad: Vad | null = null
+  try {
+    vad = await startVad(vadConfig())
+  } catch {
+    vad = null
   }
 
   let stopped = false
   let running = false
+  let muted = false
   let rec: any = null
   let settled = ''
   let interim = ''
@@ -659,7 +834,7 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     diag.heardAt = Date.now()
     if (mode === 'wake') {
       assemble.cancel()
-      if (WAKE.test(text) && Date.now() - lastWake > WAKE_DEBOUNCE) {
+      if (findWake(text) && Date.now() - lastWake > WAKE_DEBOUNCE) {
         lastWake = Date.now()
         diag.wakes++
         diag.dropped = ''
@@ -707,7 +882,7 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
 
     if (mode === 'wake') {
       settled += fresh
-      if (WAKE.test(heard) && Date.now() - lastWake > WAKE_DEBOUNCE) {
+      if (findWake(heard) && Date.now() - lastWake > WAKE_DEBOUNCE) {
         lastWake = Date.now()
         diag.wakes++
         const trailing = afterWake(heard)
@@ -722,27 +897,13 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     settled += fresh
     const full = `${settled} ${interim}`.replace(/\s+/g, ' ').trim()
     if (!started || (mode === 'guard' && !barged)) {
-      const words = full.split(/\s+/).filter(Boolean).length
-      if (mode === 'guard') {
-        // An override word cuts through everything below it — "stop" has to
-        // work on the first syllable or it is not a stop button.
-        if (!OVERRIDE.test(full)) {
-          // His own first syllable, same as the premium path. This engine has
-          // no energy gate, so without the clock the only defence is the word
-          // count below, and a single clear word is exactly what leaks first.
-          const since = speakingSince()
-          if (since && Date.now() - since < SELF_GUARD_MS) {
-            diag.selfGuarded++
-            return
-          }
-          // Two words before this engine believes an interruption. The energy
-          // path can be instant because it triggers on loudness the canceller
-          // has already had a pass at; here the evidence is a transcript of
-          // audio that includes his own playback, and one word of that is not
-          // evidence of anything.
-          if (words < 2) return
-        }
-      }
+      // Real interruptions are confirmed by the VAD instance above, on
+      // energy — not guessed from word count the way this used to work, since
+      // a genuine two-word reply reads identically to two words of his own
+      // echo leaking back in. Text keeps exactly one vote here: an explicit
+      // override word cuts through immediately even if it was spoken too
+      // quietly for the energy gate to have already caught it.
+      if (mode === 'guard' && !OVERRIDE.test(full)) return
       started = true
       if (mode === 'guard') barged = true
       h.onSpeechStart()
@@ -756,11 +917,11 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
   }
 
   const spin = () => {
-    if (stopped || running) return
+    if (stopped || running || muted) return
     rec = new Ctor()
     rec.continuous = true
     rec.interimResults = true
-    rec.lang = 'en-GB'
+    rec.lang = 'tr-TR'
     rec.onstart = () => {
       running = true
       diag.running = true
@@ -781,7 +942,7 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
       diag.running = false
       touch()
       rec = null
-      if (!stopped) setTimeout(spin, 80)
+      if (!stopped && !muted) setTimeout(spin, 80)
     }
     try {
       rec.start()
@@ -793,10 +954,16 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
 
   spin()
 
+  // Raise the VAD's trigger bar exactly while he speaks — same reasoning as
+  // the premium path's identical poll.
+  const guardPoll = setInterval(() => {
+    vad?.setGuard(h.mode() === 'guard')
+  }, 200)
+
   // The heartbeat. If nothing has been heard from the engine for a while it has
   // gone quiet on us — tear it down and build a fresh one.
   const health = setInterval(() => {
-    if (stopped) return
+    if (stopped || muted) return
     const idle = Date.now() - lastAlive
     diag.idleMs = idle
     if (idle < 15000) return
@@ -817,9 +984,11 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     stop: () => {
       stopped = true
       clearInterval(health)
+      clearInterval(guardPoll)
       clearSilence()
       assemble.cancel()
       diag.running = false
+      vad?.stop()
       try {
         rec?.abort()
       } catch {
@@ -827,5 +996,30 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
       }
     },
     live: () => running,
+    setMuted: (m) => {
+      if (m === muted) return
+      muted = m
+      if (m) {
+        try {
+          rec?.abort()
+        } catch {
+          /* noop */
+        }
+        diag.running = false
+        vad?.stop()
+        vad = null
+        // This engine's own capture is internal to the browser and releases
+        // itself on abort(); the shared getMic() stream (the level meter,
+        // the VAD energy gate above, and the premium path when it is active)
+        // does not, so it needs the explicit release to actually drop the OS
+        // mic indicator.
+        releaseMic()
+      } else {
+        spin()
+        void startVad(vadConfig()).then((v) => {
+          vad = v
+        })
+      }
+    },
   }
 }

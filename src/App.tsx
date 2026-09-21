@@ -47,13 +47,16 @@ import { env } from './config'
  */
 
 /** How long to wait for someone to start speaking after he wakes. Generous:
- *  people say his name and *then* think about what they wanted. */
-const AWAIT_SPEECH_MS = 14000
+ *  people say his name and *then* think about what they wanted. Raised from
+ *  14s after a real drop: the question arrived after the window had already
+ *  closed and gone back to wake-only, so it was heard without the name and
+ *  correctly rejected — the fix is more time to think, not looser matching. */
+const AWAIT_SPEECH_MS = 22000
 
 /** After an answer, how long the mic stays open for a follow-up before he
  *  drops back to standby. Long enough that you don't have to say the name
  *  again to continue a thought. */
-const FOLLOW_UP_MS = 11000
+const FOLLOW_UP_MS = 16000
 
 /** crypto.randomUUID needs a secure context, which a LAN address over plain
  *  http is not. Not worth failing a whole turn over an id. */
@@ -69,7 +72,7 @@ const BARE_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}[\\s,.!?]*$`, 'i
 /** A leading vocative on a real command: "Jarvis, what's the weather". */
 const LEADING_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}\\b[\\s,.:!?-]*`, 'i')
 
-export default function App() {
+export default function App({ autoStart = false }: { autoStart?: boolean }) {
   const store = useStore
   const phase = useStore((s) => s.phase)
   const history = useRef<Msg[]>([])
@@ -203,7 +206,7 @@ export default function App() {
       sfx.play('error')
       store
         .getState()
-        .setError(err instanceof Error ? err.message : 'Something went wrong.')
+        .setError(err instanceof Error ? err.message : 'Bir şeyler ters gitti.')
     } finally {
       if (!stale()) {
         speaker.current = null
@@ -222,6 +225,7 @@ export default function App() {
 
   /** What the voice loop should do with what it hears, derived from phase. */
   const mode = (): VoiceMode => {
+    if (store.getState().micMuted) return 'deaf'
     switch (store.getState().phase) {
       case 'offline':
       case 'boot':
@@ -340,11 +344,53 @@ export default function App() {
         .getState()
         .setError(
           err instanceof Error
-            ? `Power-up failed: ${err.message}`
-            : 'Power-up failed. Click to try again.',
+            ? `Başlatma başarısız: ${err.message}`
+            : 'Başlatma başarısız. Tekrar denemek için tıklayın.',
         )
     }
   }
+
+  // Entering the PIN is itself the user gesture browsers require before audio
+  // can play, so a correct PIN can boot straight through rather than landing
+  // on the ignition button a second time. Only fires when Lock actually just
+  // unlocked from a real keypress — never when there is no PIN configured at
+  // all, since then nothing has happened yet to satisfy that requirement.
+  useEffect(() => {
+    if (autoStart) void powerOn()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  /**
+   * The real fix for hearing himself: while he is thinking, running a tool,
+   * or actually talking, the microphone is not just ignored, it is switched
+   * off — genuinely released, the same way the 0 key releases it. An open
+   * mic in the same room as a speaker is a problem no amount of energy- or
+   * text-based guessing closes for good; taking the mic off the table for
+   * those phases closes it completely instead.
+   *
+   * The trade this makes is deliberate: voice barge-in is gone, because
+   * there is nothing left listening to barge in with. Space still cuts him
+   * off instantly — it is a keypress, not audio, so it owes nothing to the
+   * microphone being live — and the moment it (or anything else) moves the
+   * phase back to 'listening', this reopens the mic on its own.
+   *
+   * A manual mute from the 0 key composes with this rather than fighting
+   * it: either one wanting the mic off is enough, and both have to agree
+   * before it reopens.
+   */
+  const micMuted = useStore((s) => s.micMuted)
+  const guardMuted = useRef(false)
+  useEffect(() => {
+    const guardPhase = phase === 'thinking' || phase === 'tooling' || phase === 'speaking'
+    const shouldMute = micMuted || guardPhase
+    if (shouldMute === guardMuted.current) return
+    guardMuted.current = shouldMute
+    voice.current?.setMuted(shouldMute)
+    // setMuted(true) releases the shared mic stream the level meter reads
+    // from, so reopening it has to rebuild that graph too — otherwise the
+    // reactor's pulse stays flat even once the recogniser is listening again.
+    if (!shouldMute) void startAnalyser()
+  }, [phase, micMuted])
 
   const ignite = async () => {
     const s = store.getState()
@@ -353,11 +399,10 @@ export default function App() {
     // AudioContext or speech synthesis without a user gesture.
     await sfx.unlockAudio()
     sfx.play('boot')
-    // The score. Must be started from inside this click handler for the same
-    // reason as the rest of the audio.
-    music.enable()
-    music.playBoot()
-    music.startAmbient()
+    // Background score turned off by request — music.enable() is never
+    // called, so every other music.* call elsewhere (working/duck) is a
+    // no-op for the rest of the session. Short interface sounds (sfx.ts)
+    // are untouched; only the boot swell, ambient bed and tool cue are gone.
 
     s.setPhase('boot')
 
@@ -454,11 +499,11 @@ export default function App() {
     // on screen still shows it. Better to say so than to let him quietly forget.
     watchConnection((state) => {
       if (state === 'lost') {
-        store.getState().setError('Bridge connection lost — reconnecting.')
+        store.getState().setError('Bridge bağlantısı koptu — yeniden bağlanılıyor.')
       } else if (state === 'reconnected') {
         store
           .getState()
-          .setError('Bridge reconnected. The previous conversation was not kept.')
+          .setError('Bridge yeniden bağlandı. Önceki konuşma korunmadı.')
       }
     })
     const warming = warm().catch((err: Error) => s.setError(err.message))
@@ -596,7 +641,7 @@ export default function App() {
         silence()
         const demo = createSpeaker()
         speaker.current = demo
-        demo.say(`Voice set to ${name.replace(/\(.*?\)/g, '').trim()}. At your service, sir.`)
+        demo.say(`Ses ${name.replace(/\(.*?\)/g, '').trim()} olarak ayarlandı. Emrinizdeyim, efendim.`)
         void demo.end()
         return
       }
@@ -621,11 +666,26 @@ export default function App() {
                 .getState()
                 .setError(
                   err?.name === 'NotAllowedError'
-                    ? 'Camera access denied — gesture control is unavailable.'
-                    : `Gesture control failed to start: ${err?.message ?? err}`,
+                    ? 'Kamera erişimi reddedildi — el hareketi kontrolü kullanılamıyor.'
+                    : `El hareketi kontrolü başlatılamadı: ${err?.message ?? err}`,
                 )
             })
         }
+        return
+      }
+
+      // 0 cuts the mic without touching phase, boot, or anything on screen —
+      // a hard mute for when the room needs to talk over him without waking
+      // him. Independent of Escape, which stands the whole assistant down.
+      if (e.key === '0' && !e.repeat && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault()
+        const muted = !store.getState().micMuted
+        store.getState().setMicMuted(muted)
+        // Actually applying it (voice.current?.setMuted + reopening the level
+        // meter) is centralised in the guardMuted effect below, which reacts
+        // to this same store value — one place decides what the mic should be
+        // doing, whether the reason is this key or the phase changing.
+        sfx.play(muted ? 'done' : 'listen')
         return
       }
 
@@ -638,13 +698,13 @@ export default function App() {
         silence()
         const t = createSpeaker()
         speaker.current = t
-        t.say('Audio test. If you can hear this, speech output is working, sir.')
+        t.say('Ses testi. Bunu duyabiliyorsanız ses çıkışı çalışıyor, efendim.')
         void t.end().then(() => {
           const d = (window as unknown as Record<string, Record<string, unknown>>).__tts
           console.info('[jarvis] audio test →', d)
           if (d && d.started === 0 && d.rescued === 0) {
             store.getState().setError(
-              `No sound produced. engine=${d.engine} voice=${d.voice} error=${d.lastError || 'none'}`,
+              `Ses üretilmedi. motor=${d.engine} ses=${d.voice} hata=${d.lastError || 'yok'}`,
             )
           }
         })

@@ -1,11 +1,11 @@
 @import url('https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@300;400;600&family=JetBrains+Mono:wght@300;400&display=swap');
 
 :root {
-  /* The interface cyan. `--accent` is re-declared per phase and per panel;
-     this one stays put and is what anything neutral pins itself to. */
-  --interface: #00e5ff;
+  /* Anka Media red-on-black. `--accent` is re-declared per phase and per
+     panel; this one stays put and is what anything neutral pins itself to. */
+  --interface: #c81e2b;
   --accent: var(--interface);
-  --bg: #01060c;
+  --bg: #0a0a0b;
   font-family: 'Chakra Petch', system-ui, sans-serif;
   color-scheme: dark;
 }
@@ -34,8 +34,8 @@ body::after {
     radial-gradient(ellipse at center, transparent 30%, rgba(0, 0, 0, 0.55) 100%),
     repeating-linear-gradient(
       0deg,
-      rgba(0, 229, 255, 0.028) 0px,
-      rgba(0, 229, 255, 0.028) 1px,
+      rgba(200, 30, 43, 0.028) 0px,
+      rgba(200, 30, 43, 0.028) 1px,
       transparent 1px,
       transparent 3px
     );
@@ -803,19 +803,19 @@ kbd {
   z-index: 7;
   display: grid;
   place-items: center;
-  background: radial-gradient(ellipse at center, #04121c 0%, #01060c 70%);
+  background: radial-gradient(ellipse at center, #1a0508 0%, #0a0a0b 70%);
   border: 0;
   cursor: pointer;
   font-family: inherit;
-  color: #4fd6ff;
+  color: var(--interface);
 }
 
 .ignition-ring {
   position: absolute;
   width: 240px;
   height: 240px;
-  border: 1px solid rgba(79, 214, 255, 0.28);
-  border-top-color: rgba(79, 214, 255, 0.9);
+  border: 1px solid rgba(200, 30, 43, 0.28);
+  border-top-color: rgba(200, 30, 43, 0.9);
   border-radius: 50%;
 }
 
@@ -830,7 +830,7 @@ kbd {
   font-size: 15px;
   letter-spacing: 0.52em;
   text-indent: 0.52em; /* balance the trailing letter-space */
-  text-shadow: 0 0 30px rgba(79, 214, 255, 0.7);
+  text-shadow: 0 0 30px rgba(200, 30, 43, 0.7);
 }
 
 .ignition-sub {
@@ -841,7 +841,57 @@ kbd {
 }
 
 .ignition:hover .ignition-word {
-  text-shadow: 0 0 44px rgba(79, 214, 255, 1);
+  text-shadow: 0 0 44px rgba(200, 30, 43, 1);
+}
+
+/* ----------------------------------------------------------------- lock */
+
+.lock {
+  position: fixed;
+  inset: 0;
+  z-index: 9;
+  display: grid;
+  place-items: center;
+  gap: 14px;
+  background: radial-gradient(ellipse at center, #1a0508 0%, #0a0a0b 70%);
+  color: var(--interface);
+}
+
+.lock-input {
+  width: 160px;
+  padding: 14px 0;
+  background: transparent;
+  border: 1px solid rgba(200, 30, 43, 0.35);
+  border-radius: 6px;
+  color: var(--interface);
+  font-family: inherit;
+  font-size: 22px;
+  letter-spacing: 0.6em;
+  text-indent: 0.6em;
+  text-align: center;
+  outline: none;
+}
+
+.lock-input:focus {
+  border-color: rgba(200, 30, 43, 0.8);
+}
+
+.lock-shake {
+  animation: lockShake 0.4s;
+  border-color: rgba(255, 90, 90, 0.7);
+}
+
+@keyframes lockShake {
+  0%, 100% { transform: translateX(0) }
+  20%, 60% { transform: translateX(-8px) }
+  40%, 80% { transform: translateX(8px) }
+}
+
+.lock-sub {
+  font-size: 9px;
+  letter-spacing: 0.28em;
+  opacity: 0.4;
+  text-transform: uppercase;
 }
 
 /* ------------------------------------------------------------------- boot */

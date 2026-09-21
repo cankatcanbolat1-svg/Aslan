@@ -20,12 +20,15 @@ import { BACKEND, BRIDGE_HTTP_URL, env } from '../config'
 export type Capabilities = {
   /** ElevenLabs speech-to-text (Scribe) is reachable via the bridge. */
   stt: boolean
-  /** ElevenLabs text-to-speech is reachable via the bridge. */
+  /** Some cloud/local TTS is reachable via the bridge — ElevenLabs if a key
+   *  is set, otherwise the free local Piper voice if one is installed. */
   tts: boolean
+  /** Which one `tts` actually refers to, for diagnostics and the HUD label. */
+  ttsEngine: 'elevenlabs' | 'piper' | null
 }
 
 /** Browser-only until the probe says otherwise. Safe default: the app works. */
-let current: Capabilities = { stt: false, tts: false }
+let current: Capabilities = { stt: false, tts: false, ttsEngine: null }
 let probed = false
 
 /** The last known capabilities. Read synchronously by the voice and speech
@@ -47,7 +50,7 @@ export function capabilitiesProbed(): boolean {
 export async function probeCapabilities(): Promise<Capabilities> {
   if (BACKEND !== 'bridge') {
     // No bridge to ask. Direct mode has no server-side speech, so browser only.
-    current = { stt: false, tts: false }
+    current = { stt: false, tts: false, ttsEngine: null }
     probed = true
     return current
   }
@@ -56,8 +59,16 @@ export async function probeCapabilities(): Promise<Capabilities> {
       signal: AbortSignal.timeout(3000),
     })
     if (res.ok) {
-      const h = (await res.json()) as { stt?: boolean; tts?: boolean }
-      current = { stt: Boolean(h.stt), tts: Boolean(h.tts) }
+      const h = (await res.json()) as {
+        stt?: boolean
+        tts?: boolean
+        ttsEngine?: 'elevenlabs' | 'piper' | null
+      }
+      current = {
+        stt: Boolean(h.stt),
+        tts: Boolean(h.tts),
+        ttsEngine: h.ttsEngine ?? null,
+      }
     }
   } catch {
     // Bridge down or slow — stay on the browser engines rather than blocking
@@ -71,7 +82,7 @@ export async function probeCapabilities(): Promise<Capabilities> {
 export function engineLabel(): string {
   const c = current
   if (c.stt && c.tts) return 'ElevenLabs'
-  if (c.tts) return 'ElevenLabs voice'
+  if (c.tts) return c.ttsEngine === 'piper' ? 'Piper voice' : 'ElevenLabs voice'
   // env.elevenKey is only meaningful in direct mode; harmless to mention.
   if (env.elevenKey && BACKEND !== 'bridge') return 'ElevenLabs (direct)'
   return 'browser speech'

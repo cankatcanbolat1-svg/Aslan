@@ -146,7 +146,7 @@ function Rings({ reduced }: { reduced: boolean }) {
         animate={{ opacity: 1, letterSpacing: '0.42em' }}
         transition={{ duration: 0.7, delay: 0.5, ease }}
       >
-        J.A.R.V.I.S
+        A.S.L.A.N
       </motion.text>
     </svg>
   )

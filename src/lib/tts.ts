@@ -51,7 +51,14 @@ let recentUntil = 0
 
 /** Recognition lags the speakers by a few hundred milliseconds, so a sentence
  *  keeps arriving at the microphone well after it has finished playing. */
-const ECHO_TAIL_MS = 1800
+// 1800ms proved far too short in practice: a whole multi-sentence answer was
+// still showing up as a "YOU" turn 8-14s after he finished speaking, because
+// the browser recogniser can take that long to finalise a longer segment.
+// Widened well past that. The risk this trades away is small — real user
+// speech right after he stops does not share 60%+ of its words with what he
+// just said, so isEcho still lets it through; this window only ever matters
+// for the case that word-overlap is high, which is exactly the echo case.
+const ECHO_TAIL_MS = 8000
 
 /**
  * Why you cannot hear him.
@@ -62,7 +69,7 @@ const ECHO_TAIL_MS = 1800
  * indistinguishable. This tells them apart at a glance.
  */
 export const diag = {
-  engine: 'system' as 'system' | 'kokoro' | 'elevenlabs',
+  engine: 'system' as 'system' | 'kokoro' | 'elevenlabs' | 'piper',
   /** Utterances handed to an engine — the OS voice or an audio element. */
   spoken: 0,
   /**
@@ -103,6 +110,17 @@ if (typeof window !== 'undefined') {
  */
 let nativeBroken = false
 
+/**
+ * Once the ElevenLabs proxy has failed twice in a row — almost always a
+ * quota or auth problem, since a live key that works at all tends to keep
+ * working — stop spending a failed round-trip on every sentence before
+ * falling back to the system voice anyway. Resets on a successful call, so
+ * a transient blip does not latch this off for the rest of the session the
+ * way a real quota exhaustion should.
+ */
+let cloudBroken = false
+let cloudFailures = 0
+
 let speakingAt = 0
 
 /** When the current sentence started, or 0 if nothing is being spoken. The
@@ -118,7 +136,13 @@ function setSpeaking(text: string) {
     return
   }
   if (speaking) {
-    recent = speaking
+    // Appended, not replaced: a multi-sentence answer speaks as several
+    // separate calls here, and the echo of an earlier sentence can still be
+    // landing when a later one already finished. Losing the first sentence
+    // from `recent` the moment the second one ends was why a two-sentence
+    // reply only half-matched against its own echo. Capped so an unusually
+    // long run of speech doesn't grow this without bound.
+    recent = `${recent} ${speaking}`.trim().slice(-400)
     recentUntil = Date.now() + ECHO_TAIL_MS
   }
   speaking = ''
@@ -185,12 +209,19 @@ function score(v: SpeechSynthesisVoice): number {
   // Newer macOS en-GB male voices — casual, but serviceable.
   else if (/\b(reed|rocko|eddy)\b/.test(n)) s += 40
 
+  // Turkish voices — macOS ships Yelda by default; Cem is a free download,
+  // and Chrome adds its own "Google Türkçe" voice.
+  if (n.startsWith('cem')) s += 100
+  else if (n.startsWith('yelda')) s += 70
+  else if (n.includes('google türkçe') || n.includes('google turkce')) s += 60
+
   // Higher-quality variants of whatever matched above.
   if (n.includes('premium')) s += 30
   else if (n.includes('enhanced')) s += 20
 
-  if (/en[-_]gb/i.test(v.lang)) s += 25
-  else if (/^en/i.test(v.lang)) s += 5
+  if (/tr[-_]tr/i.test(v.lang)) s += 25
+  else if (/^tr/i.test(v.lang)) s += 5
+  else if (/en[-_]gb/i.test(v.lang)) s += 15
 
   // Voices that clearly aren't a butler.
   if (/grandma|grandpa|bubbles|jester|bells|boing|whisper|zarvox|superstar|trinoids|wobble|bahh|organ|cellos|bad news|good news/.test(n)) {
@@ -212,7 +243,7 @@ const USABLE = 40
 export function candidateVoices(): SpeechSynthesisVoice[] {
   return speechSynthesis
     .getVoices()
-    .filter((v) => /^en/i.test(v.lang))
+    .filter((v) => /^tr/i.test(v.lang) || /^en/i.test(v.lang))
     .map((v) => ({ v, s: score(v) }))
     .filter((x) => x.s >= USABLE)
     .sort((a, b) => b.s - a.s)
@@ -236,7 +267,11 @@ function pickVoice(): SpeechSynthesisVoice | null {
     localStorage.removeItem(VOICE_PREF_KEY)
   }
 
-  cachedVoice = candidateVoices()[0] ?? all.find((v) => /^en/i.test(v.lang)) ?? null
+  cachedVoice =
+    candidateVoices()[0] ??
+    all.find((v) => /^tr/i.test(v.lang)) ??
+    all.find((v) => /^en/i.test(v.lang)) ??
+    null
   return cachedVoice
 }
 
@@ -244,7 +279,9 @@ function pickVoice(): SpeechSynthesisVoice | null {
  *  always naming a speechSynthesis voice that a cloud or neural engine has
  *  quietly replaced. */
 export function currentVoiceName(): string {
-  if (USE_ELEVENLABS || caps().tts) return 'ElevenLabs'
+  if (USE_ELEVENLABS || caps().tts) {
+    return caps().ttsEngine === 'piper' ? 'Piper' : 'ElevenLabs'
+  }
   if (TTS_ENGINE === 'kokoro' && !kokoro.isUnavailable()) {
     return KOKORO_VOICE.replace(/^bm_/, '')
   }
@@ -378,14 +415,20 @@ export function createSpeaker(): Speaker {
     // premium path automatic with no flag to set. It falls back to the browser
     // voice on any failure, so a student without a key still hears him speak.
     // `nativeBroken` latches on once the system voice has proved unusable.
-    if (USE_ELEVENLABS || caps().tts || nativeBroken) {
+    if ((USE_ELEVENLABS || caps().tts || nativeBroken) && !cloudBroken) {
       // Recorded at the moment the tier is chosen rather than only when the
       // native voice latches over. Without this the panel reported 'system'
       // for a session that had spoken every one of its sentences through
       // ElevenLabs, which makes the one field naming the engine useless
       // exactly when you are trying to work out which engine is at fault.
-      diag.engine = 'elevenlabs'
-      return fetchCloudAudio(text).catch(() => null)
+      diag.engine = caps().ttsEngine ?? 'elevenlabs'
+      return fetchCloudAudio(text)
+        .then((url) => {
+          cloudFailures = url ? 0 : cloudFailures + 1
+          if (cloudFailures >= 2) cloudBroken = true
+          return url
+        })
+        .catch(() => null)
     }
     if (TTS_ENGINE === 'kokoro' && !kokoro.isUnavailable()) {
       diag.engine = 'kokoro'
@@ -446,7 +489,7 @@ export function createSpeaker(): Speaker {
       if (!nativeBroken) {
         nativeBroken = true
         diag.nativeBroken = true
-        diag.engine = 'elevenlabs'
+        diag.engine = caps().ttsEngine ?? 'elevenlabs'
         console.warn('[jarvis] system voice is not producing sound — using the bridge speech proxy from here on')
       }
       const rescue = await fetchCloudAudio(item.text).catch(() => null)
@@ -477,7 +520,7 @@ export function createSpeaker(): Speaker {
       const u = new SpeechSynthesisUtterance(text)
       const voice = pickVoice()
       if (voice) u.voice = voice
-      u.lang = voice?.lang ?? 'en-GB'
+      u.lang = voice?.lang ?? 'tr-TR'
       // Deliberate, and deliberately invariant — the character's pace does not
       // change with stakes, and that steadiness is most of the effect. This
       // lands around 130 wpm, below the median for film dialogue.

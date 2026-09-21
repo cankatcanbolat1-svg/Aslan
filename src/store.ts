@@ -225,6 +225,9 @@ type State = {
   /** Whether the camera is on and hands are being tracked. Store-backed rather
    *  than read off the tracker, because the indicator has to re-render. */
   gestures: boolean
+  /** Manual mic cut, toggled with the 0 key — independent of phase, so it
+   *  overrides whatever the phase-derived voice mode would otherwise be. */
+  micMuted: boolean
   /** Set while JARVIS is taking a look, to whatever he said he was looking for.
    *  null when he is not. The camera light is on either way — this says why. */
   looking: string | null
@@ -243,6 +246,7 @@ type State = {
 
   setVoice: (v: string) => void
   setGestures: (on: boolean) => void
+  setMicMuted: (on: boolean) => void
   setLooking: (why: string | null) => void
   setBootNote: (n: string) => void
   pushPanel: (p: Panel) => void
@@ -280,6 +284,7 @@ export const useStore = create<State>((set) => ({
   connected: [],
   voice: '',
   gestures: false,
+  micMuted: false,
   looking: null,
   panels: [],
   blades: [],
@@ -290,6 +295,7 @@ export const useStore = create<State>((set) => ({
 
   setVoice: (voice) => set({ voice }),
   setGestures: (gestures) => set({ gestures }),
+  setMicMuted: (micMuted) => set({ micMuted }),
   setLooking: (looking) => set({ looking }),
   setBootNote: (bootNote) => set({ bootNote }),
   // Three is as many as fits around the reactor without crowding it. Sticky
@@ -415,16 +421,19 @@ export const useStore = create<State>((set) => ({
     }),
 }))
 
-/** Colour identity per phase — shared by the 3D scene and the 2D HUD. */
+/** Colour identity per phase — shared by the 3D scene and the 2D HUD.
+ *  Anka Media red-on-black: every phase stays in the same red family,
+ *  varying only in warmth and brightness rather than hue, to match a brand
+ *  that uses exactly one accent colour rather than a rainbow of them. */
 export const phaseColor: Record<Phase, string> = {
-  offline: '#0d4a4a',
-  boot: '#17b3b3',
-  dormant: '#12908f',
-  waking: '#5cf2ef',
-  listening: '#19d8d2',
-  thinking: '#f0a93c',
-  tooling: '#a97bff',
-  speaking: '#3ef2a8',
+  offline: '#4a1015',
+  boot: '#c81e2b',
+  dormant: '#8a1a24',
+  waking: '#ff3b4e',
+  listening: '#e63946',
+  thinking: '#ff7849',
+  tooling: '#d62839',
+  speaking: '#ff5c72',
 }
 
 /**

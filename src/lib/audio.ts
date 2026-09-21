@@ -21,6 +21,22 @@ export async function getMic(): Promise<MediaStream> {
   return stream
 }
 
+/**
+ * A real mute: stops the actual hardware track, not just what is done with
+ * its results. Muting used to only make the app ignore what it heard while
+ * the OS mic indicator stayed lit and the recogniser kept listening — this
+ * is what the 0 key actually needs it to do. `getMic()` re-opens a fresh
+ * stream afterwards, since a stopped MediaStreamTrack cannot be restarted.
+ */
+export function releaseMic(): void {
+  stream?.getTracks().forEach((t) => t.stop())
+  stream = null
+  analyser = null
+  buf = null
+  void ctx?.close()
+  ctx = null
+}
+
 export async function startAnalyser(): Promise<void> {
   if (analyser) return
   const s = await getMic()
